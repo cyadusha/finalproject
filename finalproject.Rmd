@@ -1,0 +1,139 @@
+---
+title: "final project"
+output: html_document
+---
+
+## Motivation
+
+The idea here is not only to get the top recommendations from each method but also to determine which method would deliver accurate predictions. The alternating least squares factorization method will be used in 2 cases - first on the entire dataset and next on the entire data set split into a training set (80%) and a testing set (20%). The metrics that will be used are area under the curve, mean absolute error, and root-mean-squared error.
+
+## Data Utilized
+
+The dataset utilized is a dataset that is in the `recommenderlab` package. This is the books crossing dataset. The ratings range between 0 and 11. The dataset will be converted into a data frame and then fed into the `sparklyr` connection.   
+
+```{r}
+library(sparklyr)
+library(dplyr)
+sc <- spark_connect(master = "local")
+library(recommenderlabBX)
+data(BX)
+
+books <- as(BX, 'data.frame')
+books$user <- as.numeric(books$user)
+books$item <- as.numeric(books$item)
+
+books_ratings <- sdf_copy_to(sc, books, 'books_ratings', overwrite = T)
+
+books_ratings
+```
+
+## Alternating Least Squares Factorization Results
+
+The alternating least squares method is used in order to make predictions as to how each user would rate a particular book.
+
+```{r}
+model <- ml_als_factorization(books_ratings)
+
+predictions1 <- model$.model %>% invoke("transform", spark_dataframe(books_ratings)) %>%
+  collect()
+data.frame(predictions1)[1:10,]
+```
+
+## Alternating Least Squares Factorization Results Imputed
+
+Not all of the results are accurate because some predictions are negative values and some are greater than 11. For this reason, these predictions were imputed (if the prediciton value is negative, then it should be 0; if it is greater than 11, then it should be 11.).
+
+```{r}
+p1 <- predictions1$prediction
+p1[p1 < 0] = 0
+p1[p1 > 11] = 11
+
+predictions1$prediction <- p1
+data.frame(predictions1)[1:10,]
+```
+
+## Grouping Ratings and Predictions by Book
+
+The ratings and predictions are all grouped by book. None of the average predictions exceed 10.4.
+
+```{r}
+by_item_1 <- group_by(predictions1, item)
+mean_items_1 <- data.frame(summarise(by_item_1, mean(rating), mean(prediction)))
+colnames(mean_items_1) <- c('item', 'mean rating', 'mean prediction')
+data.frame(mean_items_1[order(-mean_items_1$`mean prediction`),])[1:10,]
+```
+
+## Splitting the Dataset
+
+The dataset is split into a training set (80%) and a testing set (20%).
+
+```{r}
+partitions <- books_ratings %>% sdf_partition(training = 0.8, test = 0.2, seed = 1099)
+```
+
+## Alternating Least Squares Factorization Results (Testing Set)
+
+The alternating least squares factorization method is applied to the training set and then used to predict the results for the testing set.
+
+```{r}
+fit <- partitions$training %>% ml_als_factorization()
+
+predictions2raw <- fit$.model %>%
+  invoke("transform", spark_dataframe(partitions$test)) %>%
+  collect()
+
+data.frame(group_by(predictions2raw, item))[1:10,]
+```
+
+## Alternating Least Squares Factorization 'NA' Values
+
+There were several 'NA' values rendered in the prediction column. However, only 25% of these values were 'NA'. These values were subsetted out. 
+
+```{r}
+p2 <- subset(predictions2raw, prediction != 'NaN')
+nrow(p2)/nrow(predictions2raw)
+```
+
+## Alternating Least Squares Factorization Results Imputed (Testing Set)
+
+Like the previous case, the prediction results were imputed by replacing the negative values with 0 and the values greater than 11 with 11.
+
+```{r}
+prediction <- p2$prediction
+prediction[prediction < 0] = 0
+prediction[prediction > 11] = 11
+
+predictions2 <- data.frame(p2[,1:3], prediction)
+predictions2[1:10,]
+```
+
+## Grouping Ratings and Predictions by Book (Testing Set)
+
+The ratings and predictions were all grouped by book. Unlike the previous case, the highest predictions are 11. 
+
+```{r}
+by_item <- group_by(predictions2, item)
+meanitems <- data.frame(summarise(by_item, mean(rating), mean(prediction)))
+colnames(meanitems) <- c('item', 'mean rating', 'mean prediction')
+pmeanitems <- meanitems[order(-meanitems$`mean prediction`),]
+pmeanitems[1:10,]
+```
+
+```{r}
+library(Metrics)
+library(knitr)
+a1 <- matrix(as.vector(c(rmse(predictions1$rating,predictions1$prediction),
+mae(predictions1$rating,predictions1$prediction), auc(predictions1$rating,predictions1$prediction))))
+rownames(a1) <- c('Root-Mean-Squared Error', 'Mean Absolute Error', 'Area Under Curve') 
+a2 <- matrix(as.vector(c(rmse(predictions2$rating,predictions2$prediction),
+mae(predictions2$rating,predictions2$prediction), auc(predictions2$rating,predictions2$prediction))))
+rownames(a2) <- rownames(a1)
+
+kable(data.frame(a1,a2), col.names = c('Entire Set', 'Training/Testing'))
+```
+
+## Conclusion
+
+According to the metrics, it would be best to perform alternating least squares factorization on the entire dataset rather than splitting the dataset into a training set and a testing set and using the testing set to evaluate the model. 
+
+This way, not only would the root-mean-squared error and the mean-absolute error would be minimized; there would be absolutely no 'NA' values in the prediction results. 
